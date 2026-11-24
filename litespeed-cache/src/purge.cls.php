@@ -46,11 +46,27 @@ class Purge extends Base {
 	 */
 	protected $_purge_single = false;
 
+	/**
+	 * Blog IDs whose purge queues this CLI process stored, so shutdown can kick each one; per blog and queue name, true once a Purge All was saved there.
+	 *
+	 * @var array<int,array<string,bool>>
+	 */
+	private static $_cli_queued_blogs = [];
+
 	const X_HEADER             = 'X-LiteSpeed-Purge';
 	const X_HEADER2            = 'X-LiteSpeed-Purge2';
 	const DB_QUEUE             = 'queue';
 	const DB_QUEUE2            = 'queue2';
 	const UPGRADE_PURGE_HEADER = 'X-LiteSpeed-Purge2: public,*';
+
+	/**
+	 * Blog IDs whose purge queue this CLI process stored.
+	 *
+	 * @return array<int,int>
+	 */
+	public static function cli_queued_blogs() {
+		return array_keys( self::$_cli_queued_blogs );
+	}
 
 	/**
 	 * Persist a full page-cache invalidation before an upgrade version is committed.
@@ -553,7 +569,13 @@ class Purge extends Base {
 			return false;
 		}
 
-		if ( Router::opcache_restricted( __FILE__ ) ) {
+		// PHP applies restrict_api to the SAPI entry script, not this included plugin file.
+		// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Compare the exact SAPI path; sanitizing it would change PHP's prefix check.
+		$script = isset( $_SERVER['SCRIPT_FILENAME'] ) ? wp_unslash( $_SERVER['SCRIPT_FILENAME'] ) : '';
+		if ( 'cli' === PHP_SAPI && $script ) {
+			$script = realpath( $script );
+		}
+		if ( Router::opcache_restricted( $script ) ) {
 			self::debug( '❌ Failed to reset OPcache due to OPcache is restricted. File requesting the clear is not allowed.' );
 
 			if ( ! $silence ) {
@@ -572,7 +594,7 @@ class Purge extends Base {
 			if ( ! $silence ) {
 				$msg = __( 'Reset the OPcache failed.', 'litespeed-cache' );
 				if ( ! defined( 'LITESPEED_PURGE_SILENT' ) ) {
-					Admin_Display::success( $msg );
+					Admin_Display::error( $msg );
 				}
 			}
 
@@ -670,7 +692,10 @@ class Purge extends Base {
 
 		$tags = $this->_prepend_bid( $tags );
 
-		if ( ! array_diff( $tags, $purge2 ? $this->_pub_purge2 : $this->_pub_purge ) ) {
+		// In CLI, '*' carries no blog ID, so a Purge All after switch_to_blog() must still store that blog's own queue, once per queue.
+		$queue            = $purge2 ? self::DB_QUEUE2 : self::DB_QUEUE;
+		$is_cli_purge_all = defined( 'LITESPEED_CLI' ) && is_multisite() && in_array( '*', $tags, true ) && empty( self::$_cli_queued_blogs[ get_current_blog_id() ][ $queue ] );
+		if ( ! $is_cli_purge_all && ! array_diff( $tags, $purge2 ? $this->_pub_purge2 : $this->_pub_purge ) ) {
 			return;
 		}
 
@@ -696,7 +721,9 @@ class Purge extends Base {
 
 		if ( defined( 'LITESPEED_CLI' ) ) {
 			// Can't send, already has output, need to save and wait for next run
-			self::update_option($purge2 ? self::DB_QUEUE2 : self::DB_QUEUE, $curr_built);
+			$saved = self::update_option( $queue, $curr_built );
+			// Only a saved Purge All stops later ones on this blog and queue; a failed save or a tag-only queue does not.
+			self::$_cli_queued_blogs[ get_current_blog_id() ][ $queue ] = ! empty( self::$_cli_queued_blogs[ get_current_blog_id() ][ $queue ] ) || ( $saved && in_array( '*', $tags, true ) );
 			self::debug( 'CLI request, queue stored: ' . $curr_built );
 		} else {
 			if ( ! headers_sent() ) {
@@ -1313,8 +1340,8 @@ class Purge extends Base {
 			return $tags;
 		}
 
-		// Purge All: maybe reset crawler.
-		if ( ! $is_private && $this->conf( self::O_CRAWLER ) ) {
+		// Purge All: maybe reset crawler. Skip while switched: the Crawler singleton is bound to the blog it was built on.
+		if ( ! $is_private && ! ( is_multisite() && ms_is_switched() ) && $this->conf( self::O_CRAWLER ) ) {
 			Crawler::cls()->reset_pos();
 		}
 
